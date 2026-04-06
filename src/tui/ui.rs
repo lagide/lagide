@@ -6,7 +6,9 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{App, Tab};
+use crate::terminal::emulator::to_ratatui_color;
+
+use super::app::{App, InputMode, Tab, TunnelTypeChoice};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -56,6 +58,12 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
+    // If we have an active terminal in terminal mode, show it
+    if app.input_mode == InputMode::Terminal && app.active_terminal.is_some() {
+        draw_active_terminal(frame, app, area);
+        return;
+    }
+
     match app.active_tab {
         Tab::Dashboard => draw_dashboard(frame, app, area),
         Tab::Wsl => draw_wsl(frame, app, area),
@@ -64,6 +72,106 @@ fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Tunnels => draw_tunnels(frame, app, area),
         Tab::Sessions => draw_sessions(frame, app, area),
         Tab::SysInfo => draw_sysinfo(frame, app, area),
+    }
+}
+
+/// Render the active terminal emulator with full vt100 output
+fn draw_active_terminal(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(5)])
+        .split(area);
+
+    // Terminal tab bar
+    let tab_titles: Vec<Span> = app
+        .terminal_tabs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let style = if Some(i) == app.active_terminal {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Span::styled(format!(" {} ", t.title), style)
+        })
+        .collect();
+
+    let mut tab_line = vec![Span::styled(
+        " Terminals: ",
+        Style::default().fg(Color::Yellow),
+    )];
+    tab_line.extend(tab_titles);
+    tab_line.push(Span::styled(
+        " | Ctrl+D=close | Ctrl+\\=detach ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(tab_line)), chunks[0]);
+
+    // Terminal content
+    if let Some(idx) = app.active_terminal {
+        if let Some(tab) = app.terminal_tabs.get(idx) {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", tab.title))
+                .title_style(Style::default().fg(Color::Green))
+                .border_style(Style::default().fg(Color::Green));
+
+            let inner = block.inner(chunks[1]);
+            frame.render_widget(block, chunks[1]);
+
+            let lines = tab.emulator.get_screen_lines();
+            let (cursor_row, cursor_col) = tab.emulator.cursor_position();
+
+            for (row_idx, line) in lines.iter().enumerate() {
+                if row_idx as u16 >= inner.height {
+                    break;
+                }
+                for (col_idx, cell) in line.cells.iter().enumerate() {
+                    if col_idx as u16 >= inner.width {
+                        break;
+                    }
+
+                    let mut fg = to_ratatui_color(cell.fg);
+                    let mut bg = to_ratatui_color(cell.bg);
+
+                    if cell.inverse {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+
+                    // Highlight cursor position
+                    if row_idx == cursor_row as usize && col_idx == cursor_col as usize {
+                        fg = Color::Black;
+                        bg = Color::White;
+                    }
+
+                    let mut style = Style::default().fg(fg).bg(bg);
+                    if cell.bold {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    if cell.italic {
+                        style = style.add_modifier(Modifier::ITALIC);
+                    }
+                    if cell.underline {
+                        style = style.add_modifier(Modifier::UNDERLINED);
+                    }
+
+                    let x = inner.x + col_idx as u16;
+                    let y = inner.y + row_idx as u16;
+                    if x < inner.x + inner.width && y < inner.y + inner.height {
+                        frame.buffer_mut().set_string(
+                            x,
+                            y,
+                            &cell.c.to_string(),
+                            style,
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -302,7 +410,8 @@ fn draw_wsl(frame: &mut Frame, app: &mut App, area: Rect) {
         .wrap(Wrap { trim: false });
     frame.render_widget(output, right_chunks[0]);
 
-    let input_style = if app.input_mode {
+    let is_editing = app.input_mode == InputMode::Editing;
+    let input_style = if is_editing {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::Gray)
@@ -310,15 +419,15 @@ fn draw_wsl(frame: &mut Frame, app: &mut App, area: Rect) {
     let input = Paragraph::new(Line::from(vec![
         Span::styled("$ ", Style::default().fg(Color::Green)),
         Span::styled(app.command_input.as_str(), input_style),
-        Span::styled(if app.input_mode { "█" } else { "" }, input_style),
+        Span::styled(if is_editing { "█" } else { "" }, input_style),
     ]))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(if app.input_mode {
+            .title(if is_editing {
                 " Input (Esc to exit) "
             } else {
-                " Press 'i' to type "
+                " Press 'i' to type | Enter=open terminal "
             }),
     );
     frame.render_widget(input, right_chunks[1]);
@@ -351,7 +460,7 @@ fn draw_ssh(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 value.to_string()
             };
-            let cursor = if i == app.ssh_form.focused_field && app.input_mode {
+            let cursor = if i == app.ssh_form.focused_field && app.input_mode == InputMode::Editing {
                 "█"
             } else {
                 ""
@@ -454,10 +563,10 @@ fn draw_sftp(frame: &mut Frame, area: Rect) {
 fn draw_tunnels(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    // Active tunnels
+    // Active tunnels list
     let tunnel_list = app.tunnel_manager.list_tunnels();
     let items: Vec<ListItem> = if tunnel_list.is_empty() {
         vec![ListItem::new(Span::styled(
@@ -467,14 +576,32 @@ fn draw_tunnels(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         tunnel_list
             .iter()
-            .map(|t| {
+            .enumerate()
+            .map(|(i, t)| {
+                let style = if i == app.tunnel_selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
                 ListItem::new(Line::from(vec![
                     Span::styled("  ● ", Style::default().fg(Color::Green)),
-                    Span::styled(&t.name, Style::default().fg(Color::White)),
-                    Span::raw(format!(
-                        " {} localhost:{} -> {}:{}",
-                        t.tunnel_type, t.local_port, t.remote_host, t.remote_port
-                    )),
+                    Span::styled(&t.name, style),
+                    Span::styled(
+                        format!(
+                            " {} localhost:{} -> {}:{}  via {}@{}:{}",
+                            t.tunnel_type,
+                            t.local_port,
+                            t.remote_host,
+                            t.remote_port,
+                            t.ssh_user,
+                            t.ssh_host,
+                            t.ssh_port
+                        ),
+                        Style::default().fg(Color::Gray),
+                    ),
                 ]))
             })
             .collect()
@@ -483,12 +610,106 @@ fn draw_tunnels(frame: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Active Tunnels ")
+            .title(" Active Tunnels (j/k=select, d=stop, n=new) ")
             .title_style(Style::default().fg(Color::Cyan)),
     );
     frame.render_widget(list, chunks[0]);
 
-    // Tunnel help
+    // Tunnel creation form (bottom half)
+    if app.tunnel_form.active || app.input_mode == InputMode::TunnelForm {
+        draw_tunnel_form(frame, app, chunks[1]);
+    } else {
+        draw_tunnel_help(frame, chunks[1]);
+    }
+}
+
+fn draw_tunnel_form(frame: &mut Frame, app: &App, area: Rect) {
+    let is_tunnel_mode = app.input_mode == InputMode::TunnelForm;
+
+    let type_display = format!(
+        "< {} >  (Space to cycle)",
+        app.tunnel_form.tunnel_type.label()
+    );
+
+    let fields: Vec<(&str, String)> = vec![
+        ("Name", app.tunnel_form.name.clone()),
+        ("Type", type_display),
+        ("Local Port", app.tunnel_form.local_port.clone()),
+        ("Remote Host", app.tunnel_form.remote_host.clone()),
+        ("Remote Port", app.tunnel_form.remote_port.clone()),
+        ("SSH Host", app.tunnel_form.ssh_host.clone()),
+        ("SSH Port", app.tunnel_form.ssh_port.clone()),
+        ("SSH User", app.tunnel_form.ssh_user.clone()),
+    ];
+
+    let rows: Vec<Row> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, (label, value))| {
+            let is_focused = i == app.tunnel_form.focused_field && is_tunnel_mode;
+            let label_style = if is_focused {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let value_style = if is_focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let cursor = if is_focused { "█" } else { "" };
+
+            // Type field has special rendering
+            let display = if i == 1 {
+                let type_color = match app.tunnel_form.tunnel_type {
+                    TunnelTypeChoice::Local => Color::Green,
+                    TunnelTypeChoice::Remote => Color::Magenta,
+                    TunnelTypeChoice::Dynamic => Color::Yellow,
+                };
+                Row::new(vec![
+                    Cell::from(Span::styled(format!("  {}:", label), label_style)),
+                    Cell::from(Span::styled(value.clone(), Style::default().fg(type_color))),
+                ])
+            } else {
+                Row::new(vec![
+                    Cell::from(Span::styled(format!("  {}:", label), label_style)),
+                    Cell::from(Span::styled(format!("{}{}", value, cursor), value_style)),
+                ])
+            };
+            display
+        })
+        .collect();
+
+    let title = if is_tunnel_mode {
+        " Create Tunnel (Tab=next, Space=type, Enter=create, Esc=cancel) "
+    } else {
+        " Tunnel Form (press 'n' to activate) "
+    };
+
+    let border_color = if is_tunnel_mode {
+        Color::Yellow
+    } else {
+        Color::Gray
+    };
+
+    let table = Table::new(
+        rows,
+        [Constraint::Length(15), Constraint::Min(40)],
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .title_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(border_color)),
+    );
+    frame.render_widget(table, area);
+}
+
+fn draw_tunnel_help(frame: &mut Frame, area: Rect) {
     let help = Paragraph::new(vec![
         Line::from(Span::styled(
             "  SSH Tunnel Types",
@@ -498,30 +719,53 @@ fn draw_tunnels(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Local (-L):   ", Style::default().fg(Color::Cyan)),
+            Span::styled("  Local (-L):   ", Style::default().fg(Color::Green)),
             Span::raw("Forward local port to remote destination"),
         ]),
         Line::from(vec![
-            Span::styled("  Remote (-R):  ", Style::default().fg(Color::Cyan)),
-            Span::raw("Forward remote port to local destination"),
+            Span::styled("               ", Style::default()),
+            Span::styled(
+                "ssh -L 8080:db-server:3306 user@jump-host",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Remote (-R):  ", Style::default().fg(Color::Magenta)),
+            Span::raw("Forward remote port to local service"),
         ]),
         Line::from(vec![
-            Span::styled("  Dynamic (-D): ", Style::default().fg(Color::Cyan)),
+            Span::styled("               ", Style::default()),
+            Span::styled(
+                "ssh -R 9090:localhost:3000 user@server",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Dynamic (-D): ", Style::default().fg(Color::Yellow)),
             Span::raw("SOCKS proxy through SSH server"),
+        ]),
+        Line::from(vec![
+            Span::styled("               ", Style::default()),
+            Span::styled(
+                "ssh -D 1080 user@proxy-server",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "  Press 'n' to create a new tunnel",
+            "  Press 'n' to open the tunnel creation form",
             Style::default().fg(Color::Gray),
         )),
     ])
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Help ")
+            .title(" Tunnel Guide ")
             .title_style(Style::default().fg(Color::Green)),
     );
-    frame.render_widget(help, chunks[1]);
+    frame.render_widget(help, area);
 }
 
 fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
@@ -746,28 +990,34 @@ fn draw_help_popup(frame: &mut Frame, _app: &App) {
         Line::from("  q              Quit"),
         Line::from(""),
         Line::from(vec![
+            Span::styled("  Terminal", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from("  Ctrl+\\         Detach from terminal"),
+        Line::from("  Ctrl+D         Close terminal"),
+        Line::from("  All keys       Passed to terminal"),
+        Line::from(""),
+        Line::from(vec![
             Span::styled("  WSL Tab", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ]),
         Line::from("  j/k or ↑/↓     Select distribution"),
-        Line::from("  i              Enter input mode"),
-        Line::from("  Enter          Execute command"),
-        Line::from("  Esc            Exit input mode"),
-        Line::from("  s              Start distribution"),
-        Line::from("  x              Stop distribution"),
+        Line::from("  Enter          Open WSL terminal"),
+        Line::from("  i              Command input mode"),
+        Line::from("  s / x          Start / Stop distro"),
         Line::from(""),
         Line::from(vec![
             Span::styled("  SSH Tab", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ]),
         Line::from("  i              Edit fields"),
         Line::from("  Tab            Next field"),
-        Line::from("  Enter          Connect"),
+        Line::from("  Enter          Connect (opens terminal)"),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Sessions", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("  Tunnels", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from("  j/k or ↑/↓     Select session"),
-        Line::from("  Enter          Connect to session"),
-        Line::from("  d              Delete session"),
+        Line::from("  n              New tunnel form"),
+        Line::from("  d              Stop selected tunnel"),
+        Line::from("  Space          Cycle tunnel type"),
+        Line::from("  Enter          Create tunnel"),
     ];
 
     let help = Paragraph::new(help_text)
